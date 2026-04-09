@@ -1,0 +1,12 @@
+[project]
+name = "cachyos-update-tray"
+version = "0.1.0"
+description = "CachyOS tray app with pacman update checks and manual system upgrade"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "PySide6>=6.8.0",
+]
+
+[project.scripts]
+cachyos-update-tray = "app:main"
