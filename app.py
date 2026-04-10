@@ -544,13 +544,19 @@ class TrayApp:
         self.worker: CheckUpdatesWorker | None = None
         self.log_dialog: LogDialog | None = None
         self.live_log_dialog: LogDialog | None = None
-        self.update_watch_timer = QTimer()
-        self.update_watch_timer.timeout.connect(self._poll_update_status)
 
         self.app = QApplication(sys.argv)
         self.app.setQuitOnLastWindowClosed(False)
         self.app.setApplicationName(APP_NAME)
         self.app.setApplicationDisplayName(APP_NAME)
+
+        self.update_watch_timer = QTimer(self.app)
+        self.update_watch_timer.timeout.connect(self._poll_update_status)
+        self.timer = QTimer(self.app)
+        self.timer.timeout.connect(self.check_for_updates)
+        self.startup_check_timer = QTimer(self.app)
+        self.startup_check_timer.setSingleShot(True)
+        self.startup_check_timer.timeout.connect(self._startup_check)
 
         self.tray = QSystemTrayIcon()
         self.tray.setContextMenu(self._build_menu())
@@ -559,10 +565,8 @@ class TrayApp:
         self._refresh_menu_labels()
         self.tray.show()
 
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.check_for_updates)
         self._reset_check_timer()
-        QTimer.singleShot(1200, self.check_for_updates)
+        self.startup_check_timer.start(1200)
 
         if self.persisted.last_update_started_at and not self.persisted.last_update_finished_at:
             self.update_watch_timer.start(2000)
@@ -692,6 +696,9 @@ class TrayApp:
 
     def _reset_check_timer(self) -> None:
         self.timer.start(self.config.interval_minutes * 60 * 1000)
+
+    def _startup_check(self) -> None:
+        self.check_for_updates(silent=True)
 
     def _handle_tray_activation(self, reason: QSystemTrayIcon.ActivationReason) -> None:
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
