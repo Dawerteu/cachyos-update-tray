@@ -54,6 +54,10 @@ PACMAN_CACHE_DIR = Path("/var/cache/pacman/pkg")
 PACMAN_LOG_PATH = Path("/var/log/pacman.log")
 MODULES_DIR = Path("/usr/lib/modules")
 DEFAULT_INTERVAL_MINUTES = 60
+DEFAULT_REMINDER_MINUTES = 180
+DEFAULT_LOG_RETENTION_DAYS = 0
+DEFAULT_STARTUP_CHECK_DELAY_MS = 1200
+STARTUP_ONLY_CHECK_DELAY_MS = 3 * 60 * 1000
 DEFAULT_IGNORE_PACKAGES: list[str] = []
 PACMAN_LOG_TRANSACTION_LIMIT = 40
 PACMAN_CHANGELOG_LINES = 32
@@ -94,7 +98,8 @@ PACMAN_EVENT_RE = re.compile(
 @dataclass
 class AppConfig:
     interval_minutes: int = DEFAULT_INTERVAL_MINUTES
-    log_retention_days: int = 30
+    reminder_minutes: int = DEFAULT_REMINDER_MINUTES
+    log_retention_days: int = DEFAULT_LOG_RETENTION_DAYS
     ignored_packages: list[str] = field(default_factory=lambda: list(DEFAULT_IGNORE_PACKAGES))
 
 
@@ -103,6 +108,9 @@ class PersistedState:
     last_check_at: str = ""
     last_check_status: str = "never"
     last_error: str = ""
+    last_notified_at: str = ""
+    last_notified_packages: list[str] = field(default_factory=list)
+    last_notified_status: str = ""
     last_update_started_at: str = ""
     last_update_finished_at: str = ""
     last_update_exit_code: int | None = None
@@ -272,17 +280,28 @@ class SettingsDialog(QDialog):
     def __init__(self, config: AppConfig, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Settings")
-        self.resize(520, 220)
+        self.resize(560, 320)
 
         layout = QVBoxLayout(self)
         form = QFormLayout()
 
-        self.interval_input = QLineEdit(str(config.interval_minutes))
-        form.addRow("Check interval (min):", self.interval_input)
+        self.interval_input = QLineEdit(str(config.interval_minutes if config.interval_minutes > 0 else DEFAULT_INTERVAL_MINUTES))
+        self.interval_input.setPlaceholderText(str(DEFAULT_INTERVAL_MINUTES))
+        self.interval_never_checkbox = QCheckBox("Never")
+        self.interval_never_checkbox.setChecked(config.interval_minutes <= 0)
+        form.addRow("Check interval (min):", self._time_setting_row(self.interval_input, self.interval_never_checkbox))
 
-        self.log_retention_input = QLineEdit(str(config.log_retention_days))
-        self.log_retention_input.setPlaceholderText("0 disables automatic cleanup")
-        form.addRow("Delete logs older than (days):", self.log_retention_input)
+        self.reminder_input = QLineEdit(str(config.reminder_minutes if config.reminder_minutes > 0 else DEFAULT_REMINDER_MINUTES))
+        self.reminder_input.setPlaceholderText(str(DEFAULT_REMINDER_MINUTES))
+        self.reminder_never_checkbox = QCheckBox("Never mention")
+        self.reminder_never_checkbox.setChecked(config.reminder_minutes <= 0)
+        form.addRow("Reminder for same updates (min):", self._time_setting_row(self.reminder_input, self.reminder_never_checkbox))
+
+        self.log_retention_input = QLineEdit(str(config.log_retention_days if config.log_retention_days > 0 else DEFAULT_LOG_RETENTION_DAYS))
+        self.log_retention_input.setPlaceholderText(str(DEFAULT_LOG_RETENTION_DAYS))
+        self.log_retention_never_checkbox = QCheckBox("Never remove")
+        self.log_retention_never_checkbox.setChecked(config.log_retention_days <= 0)
+        form.addRow("Delete logs older than (days):", self._time_setting_row(self.log_retention_input, self.log_retention_never_checkbox))
 
         self.ignore_input = QLineEdit(", ".join(config.ignored_packages))
         self.ignore_input.setPlaceholderText("for example firefox, thunderbird")
@@ -290,7 +309,7 @@ class SettingsDialog(QDialog):
         layout.addLayout(form)
 
         help_label = QLabel(
-            "Separate ignored packages with commas. Saved update logs older than the configured number of days are removed automatically. Use 0 to keep them."
+            "Each time-based setting can use a custom value or be disabled with its Never checkbox. Never check still performs one startup check after about 3 minutes, then stops periodic checks."
         )
         help_label.setWordWrap(True)
         layout.addWidget(help_label)
@@ -305,11 +324,35 @@ class SettingsDialog(QDialog):
         buttons.addWidget(cancel_button)
         layout.addLayout(buttons)
 
+        self._toggle_time_input(self.interval_input, self.interval_never_checkbox.isChecked())
+        self._toggle_time_input(self.reminder_input, self.reminder_never_checkbox.isChecked())
+        self._toggle_time_input(self.log_retention_input, self.log_retention_never_checkbox.isChecked())
+        self.interval_never_checkbox.toggled.connect(lambda checked: self._toggle_time_input(self.interval_input, checked))
+        self.reminder_never_checkbox.toggled.connect(lambda checked: self._toggle_time_input(self.reminder_input, checked))
+        self.log_retention_never_checkbox.toggled.connect(lambda checked: self._toggle_time_input(self.log_retention_input, checked))
+
+    def _time_setting_row(self, input_widget: QLineEdit, never_checkbox: QCheckBox) -> QWidget:
+        row = QWidget()
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.addWidget(input_widget)
+        row_layout.addWidget(never_checkbox)
+        return row
+
+    def _toggle_time_input(self, input_widget: QLineEdit, never_enabled: bool) -> None:
+        input_widget.setEnabled(not never_enabled)
+
     def result_config(self) -> AppConfig:
-        interval = max(5, int(self.interval_input.text().strip() or DEFAULT_INTERVAL_MINUTES))
-        retention = max(0, int(self.log_retention_input.text().strip() or 0))
+        interval = 0 if self.interval_never_checkbox.isChecked() else max(5, int(self.interval_input.text().strip() or DEFAULT_INTERVAL_MINUTES))
+        reminder = 0 if self.reminder_never_checkbox.isChecked() else max(1, int(self.reminder_input.text().strip() or DEFAULT_REMINDER_MINUTES))
+        retention = 0 if self.log_retention_never_checkbox.isChecked() else max(1, int(self.log_retention_input.text().strip() or DEFAULT_LOG_RETENTION_DAYS))
         ignored = [item.strip() for item in self.ignore_input.text().split(",") if item.strip()]
-        return AppConfig(interval_minutes=interval, log_retention_days=retention, ignored_packages=ignored)
+        return AppConfig(
+            interval_minutes=interval,
+            reminder_minutes=reminder,
+            log_retention_days=retention,
+            ignored_packages=ignored,
+        )
 
 
 class LogManagementDialog(QDialog):
@@ -566,7 +609,7 @@ class TrayApp:
         self.tray.show()
 
         self._reset_check_timer()
-        self.startup_check_timer.start(1200)
+        self._schedule_startup_check()
 
         if self.persisted.last_update_started_at and not self.persisted.last_update_finished_at:
             self.update_watch_timer.start(2000)
@@ -584,8 +627,9 @@ class TrayApp:
         try:
             data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
             return AppConfig(
-                interval_minutes=max(5, int(data.get("interval_minutes", DEFAULT_INTERVAL_MINUTES))),
-                log_retention_days=max(0, int(data.get("log_retention_days", 30))),
+                interval_minutes=max(0, int(data.get("interval_minutes", DEFAULT_INTERVAL_MINUTES))),
+                reminder_minutes=max(0, int(data.get("reminder_minutes", DEFAULT_REMINDER_MINUTES))),
+                log_retention_days=max(0, int(data.get("log_retention_days", DEFAULT_LOG_RETENTION_DAYS))),
                 ignored_packages=list(data.get("ignored_packages", DEFAULT_IGNORE_PACKAGES)),
             )
         except Exception:
@@ -605,6 +649,9 @@ class TrayApp:
                 last_check_at=data.get("last_check_at", ""),
                 last_check_status=data.get("last_check_status", "never"),
                 last_error=data.get("last_error", ""),
+                last_notified_at=str(data.get("last_notified_at", "")),
+                last_notified_packages=list(data.get("last_notified_packages", [])),
+                last_notified_status=str(data.get("last_notified_status", "")),
                 last_update_started_at=data.get("last_update_started_at", ""),
                 last_update_finished_at=data.get("last_update_finished_at", ""),
                 last_update_exit_code=data.get("last_update_exit_code"),
@@ -695,7 +742,14 @@ class TrayApp:
         return menu
 
     def _reset_check_timer(self) -> None:
-        self.timer.start(self.config.interval_minutes * 60 * 1000)
+        self.timer.stop()
+        if self.config.interval_minutes > 0:
+            self.timer.start(self.config.interval_minutes * 60 * 1000)
+
+    def _schedule_startup_check(self) -> None:
+        self.startup_check_timer.stop()
+        delay_ms = STARTUP_ONLY_CHECK_DELAY_MS if self.config.interval_minutes <= 0 else DEFAULT_STARTUP_CHECK_DELAY_MS
+        self.startup_check_timer.start(delay_ms)
 
     def _startup_check(self) -> None:
         self.check_for_updates(silent=True)
@@ -912,8 +966,10 @@ class TrayApp:
         self._cleanup_old_logs()
         self.state.ignored_packages = list(self.config.ignored_packages)
         self._reset_check_timer()
+        self._schedule_startup_check()
         self.tray.showMessage(APP_NAME, "Settings saved.", QSystemTrayIcon.MessageIcon.Information, 3000)
-        self.check_for_updates(silent=True)
+        if self.config.interval_minutes > 0:
+            self.check_for_updates(silent=True)
 
     def check_for_updates(self, silent: bool = False) -> None:
         if self.worker is not None and self.worker.isRunning():
@@ -934,6 +990,8 @@ class TrayApp:
         self.worker = None
 
     def _handle_check_result(self, state: UpdateState, silent: bool) -> None:
+        previous_packages = list(self.persisted.pending_update_packages)
+        previous_status = self.persisted.last_check_status
         if not state.reboot_recommended:
             self.persisted.restart_notification_cleared = False
         visible_reboot = state.reboot_recommended and not self.persisted.restart_notification_cleared
@@ -953,10 +1011,36 @@ class TrayApp:
         self._set_state_icon(self._current_icon_state())
         self._refresh_menu_labels()
 
-        if state.update_count and not silent:
+        packages_changed = previous_packages != state.packages
+        reminder_due = self._is_update_reminder_due()
+        should_notify_updates = (
+            state.update_count
+            and not silent
+            and (
+                self.persisted.last_notified_status != "updates"
+                or self.persisted.last_notified_packages != state.packages
+                or packages_changed
+                or reminder_due
+            )
+        )
+        should_notify_uptodate = (
+            not state.update_count
+            and not silent
+            and (self.persisted.last_notified_status != "up-to-date" or previous_status == "error" or previous_packages)
+        )
+
+        if should_notify_updates:
             self.tray.showMessage(APP_NAME, f"Found {state.update_count} updates.", QSystemTrayIcon.MessageIcon.Information, 4000)
-        elif not state.update_count and not silent:
+            self.persisted.last_notified_at = state.last_check_at
+            self.persisted.last_notified_status = "updates"
+            self.persisted.last_notified_packages = list(state.packages)
+            self._save_persisted_state(self.persisted)
+        elif should_notify_uptodate:
             self.tray.showMessage(APP_NAME, "System is up to date.", QSystemTrayIcon.MessageIcon.Information, 3500)
+            self.persisted.last_notified_at = state.last_check_at
+            self.persisted.last_notified_status = "up-to-date"
+            self.persisted.last_notified_packages = []
+            self._save_persisted_state(self.persisted)
 
     def _handle_check_error(self, message: str, silent: bool) -> None:
         self.persisted.last_check_status = "error"
@@ -967,6 +1051,21 @@ class TrayApp:
         self._refresh_menu_labels()
         if not silent:
             self.tray.showMessage(APP_NAME, f"Update check failed: {message}", QSystemTrayIcon.MessageIcon.Warning, 6000)
+
+    def _is_update_reminder_due(self) -> bool:
+        if self.config.reminder_minutes <= 0:
+            return False
+        if self.persisted.last_notified_status != "updates":
+            return False
+        if self.persisted.last_notified_packages != self.persisted.pending_update_packages:
+            return False
+        if not self.persisted.last_notified_at:
+            return True
+        try:
+            last_notified = datetime.strptime(self.persisted.last_notified_at, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return True
+        return datetime.now() >= last_notified + timedelta(minutes=self.config.reminder_minutes)
 
     def show_updates(self) -> None:
         ignored_note = ""

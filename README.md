@@ -71,10 +71,15 @@ On first launch, the app creates:
 ```json
 {
   "interval_minutes": 60,
-  "log_retention_days": 30,
+  "reminder_minutes": 180,
+  "log_retention_days": 0,
   "ignored_packages": []
 }
 ```
+
+- `interval_minutes: 0` means no periodic checks; the app only runs one startup check after about 3 minutes
+- `reminder_minutes: 0` means never repeat the same update reminder
+- `log_retention_days: 0` means never auto-remove saved logs
 
 ## Folder Usage
 
