@@ -13,7 +13,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from PySide6.QtCore import QThread, QTimer, Qt, Signal
+from PySide6.QtCore import QLockFile, QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -46,6 +46,7 @@ CONFIG_PATH = CONFIG_DIR / "config.json"
 STATE_PATH = STATE_DIR / "state.json"
 LOG_PATH = STATE_DIR / "last-update.log"
 STATUS_PATH = STATE_DIR / "update-status.json"
+INSTANCE_LOCK_PATH = STATE_DIR / f"{APP_ID}.lock"
 LAUNCHER_PATH = HOME_DIR / ".local" / "share" / "applications" / f"{APP_ID}.desktop"
 AUTOSTART_PATH = HOME_DIR / ".config" / "autostart" / f"{APP_ID}.desktop"
 INSTALLED_RUNNER_PATH = LOCAL_BIN_DIR / APP_ID
@@ -587,11 +588,16 @@ class TrayApp:
         self.worker: CheckUpdatesWorker | None = None
         self.log_dialog: LogDialog | None = None
         self.live_log_dialog: LogDialog | None = None
+        self.dialog_windows: dict[str, QWidget] = {}
 
         self.app = QApplication(sys.argv)
         self.app.setQuitOnLastWindowClosed(False)
         self.app.setApplicationName(APP_NAME)
         self.app.setApplicationDisplayName(APP_NAME)
+        self.instance_lock = QLockFile(str(INSTANCE_LOCK_PATH))
+        self.instance_lock.setStaleLockTime(0)
+        if not self.instance_lock.tryLock(0):
+            raise RuntimeError("already-running")
 
         self.update_watch_timer = QTimer(self.app)
         self.update_watch_timer.timeout.connect(self._poll_update_status)
@@ -759,6 +765,8 @@ class TrayApp:
             self._handle_left_click()
 
     def _handle_left_click(self) -> None:
+        if self._raise_dialog("tray_left_click"):
+            return
         if not self.state.packages:
             self.show_updates()
             return
@@ -767,6 +775,8 @@ class TrayApp:
         dialog.setWindowTitle(APP_NAME)
         dialog.setIcon(QMessageBox.Icon.Information)
         dialog.setText(f"{self.state.update_count} pending updates found.")
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self._register_dialog("tray_left_click", dialog)
 
         info_lines = ["Select an action."]
         if self.state.reboot_recommended:
@@ -781,15 +791,18 @@ class TrayApp:
         list_button = dialog.addButton("Show list", QMessageBox.ButtonRole.ActionRole)
         dialog.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
         dialog.setDefaultButton(download_button)
-        dialog.exec()
+        dialog.finished.connect(lambda _result: self._unregister_dialog("tray_left_click", dialog))
+        dialog.open()
 
-        clicked = dialog.clickedButton()
-        if clicked is download_button:
-            self.run_system_update()
-        elif clicked is news_button:
-            self.show_package_news()
-        elif clicked is list_button:
-            self.show_updates()
+        def handle_click(button: object) -> None:
+            if button is download_button:
+                self.run_system_update()
+            elif button is news_button:
+                self.show_package_news()
+            elif button is list_button:
+                self.show_updates()
+
+        dialog.buttonClicked.connect(handle_click)
 
     def _set_state_icon(self, state: str) -> None:
         colors = {
@@ -917,8 +930,30 @@ class TrayApp:
         self.manage_logs_action.setText(f"Manage saved logs ({log_count})")
         self.news_action.setEnabled(bool(self.state.packages))
         self.clear_restart_action.setEnabled(self.state.reboot_recommended)
+        self.launcher_action.setText("Remove app launcher" if LAUNCHER_PATH.exists() else "Install app launcher")
         self.disable_autostart_action.setEnabled(AUTOSTART_PATH.exists())
         self.autostart_action.setEnabled(not AUTOSTART_PATH.exists())
+
+    def _register_dialog(self, key: str, widget: QWidget) -> None:
+        self.dialog_windows[key] = widget
+        widget.destroyed.connect(lambda _obj=None, dialog_key=key, dialog_widget=widget: self._unregister_dialog(dialog_key, dialog_widget))
+
+    def _unregister_dialog(self, key: str, widget: QWidget | None = None) -> None:
+        existing = self.dialog_windows.get(key)
+        if existing is None:
+            return
+        if widget is not None and existing is not widget:
+            return
+        self.dialog_windows.pop(key, None)
+
+    def _raise_dialog(self, key: str) -> bool:
+        widget = self.dialog_windows.get(key)
+        if widget is None:
+            return False
+        widget.show()
+        widget.raise_()
+        widget.activateWindow()
+        return True
 
     def _write_desktop_file(self, target: Path) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -939,7 +974,27 @@ class TrayApp:
         target.write_text(desktop_text, encoding="utf-8")
 
     def install_launcher(self) -> None:
+        if LAUNCHER_PATH.exists():
+            reply = QMessageBox.question(
+                None,
+                APP_NAME,
+                f"A desktop launcher already exists at:\n\n{LAUNCHER_PATH}\n\nDo you want to remove it?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            try:
+                LAUNCHER_PATH.unlink()
+            except OSError as exc:
+                QMessageBox.warning(None, APP_NAME, f"Failed to remove launcher: {exc}")
+                return
+            self._refresh_menu_labels()
+            self.tray.showMessage(APP_NAME, "Launcher removed.", QSystemTrayIcon.MessageIcon.Information, 4000)
+            return
+
         self._write_desktop_file(LAUNCHER_PATH)
+        self._refresh_menu_labels()
         self.tray.showMessage(APP_NAME, f"Launcher created at {LAUNCHER_PATH}", QSystemTrayIcon.MessageIcon.Information, 4000)
 
     def enable_autostart(self) -> None:
@@ -954,22 +1009,32 @@ class TrayApp:
         self.tray.showMessage(APP_NAME, "Autostart disabled.", QSystemTrayIcon.MessageIcon.Information, 4000)
 
     def open_settings(self) -> None:
+        if self._raise_dialog("settings"):
+            return
         dialog = SettingsDialog(self.config)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        try:
-            self.config = dialog.result_config()
-        except ValueError:
-            QMessageBox.warning(None, APP_NAME, "Interval and log retention must be numbers.")
-            return
-        self._save_config(self.config)
-        self._cleanup_old_logs()
-        self.state.ignored_packages = list(self.config.ignored_packages)
-        self._reset_check_timer()
-        self._schedule_startup_check()
-        self.tray.showMessage(APP_NAME, "Settings saved.", QSystemTrayIcon.MessageIcon.Information, 3000)
-        if self.config.interval_minutes > 0:
-            self.check_for_updates(silent=True)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self._register_dialog("settings", dialog)
+
+        def handle_finished(result: int) -> None:
+            self._unregister_dialog("settings", dialog)
+            if result != int(QDialog.DialogCode.Accepted):
+                return
+            try:
+                self.config = dialog.result_config()
+            except ValueError:
+                QMessageBox.warning(None, APP_NAME, "Interval and log retention must be numbers.")
+                return
+            self._save_config(self.config)
+            self._cleanup_old_logs()
+            self.state.ignored_packages = list(self.config.ignored_packages)
+            self._reset_check_timer()
+            self._schedule_startup_check()
+            self.tray.showMessage(APP_NAME, "Settings saved.", QSystemTrayIcon.MessageIcon.Information, 3000)
+            if self.config.interval_minutes > 0:
+                self.check_for_updates(silent=True)
+
+        dialog.finished.connect(handle_finished)
+        dialog.open()
 
     def check_for_updates(self, silent: bool = False) -> None:
         if self.worker is not None and self.worker.isRunning():
@@ -1068,6 +1133,8 @@ class TrayApp:
         return datetime.now() >= last_notified + timedelta(minutes=self.config.reminder_minutes)
 
     def show_updates(self) -> None:
+        if self._raise_dialog("updates"):
+            return
         ignored_note = ""
         if self.config.ignored_packages:
             ignored_note = f"\n\nIgnored packages: {', '.join(self.config.ignored_packages)}"
@@ -1077,15 +1144,17 @@ class TrayApp:
             if self.state.reboot_reason:
                 reboot_note += f"\nReason: {self.state.reboot_reason}"
         if not self.state.packages:
-            QMessageBox.information(None, APP_NAME, f"No pending updates.{reboot_note}{ignored_note}")
+            self._show_message_dialog("updates", APP_NAME, f"No pending updates.{reboot_note}{ignored_note}")
             return
 
         packages = "\n".join(self.state.packages)
-        QMessageBox.information(None, APP_NAME, f"Pending updates ({self.state.update_count}):\n\n{packages}{reboot_note}{ignored_note}")
+        self._show_message_dialog("updates", APP_NAME, f"Pending updates ({self.state.update_count}):\n\n{packages}{reboot_note}{ignored_note}")
 
     def show_package_news(self) -> None:
+        if self._raise_dialog("package_changes"):
+            return
         if not self.state.packages:
-            QMessageBox.information(None, APP_NAME, "No pending updates are available.")
+            self._show_message_dialog("package_changes", APP_NAME, "No pending updates are available.")
             return
 
         sections: list[str] = []
@@ -1100,9 +1169,11 @@ class TrayApp:
         self._show_text_dialog("Package Changes", "\n\n".join(sections))
 
     def show_saved_log_dialog(self) -> None:
+        if self._raise_dialog("saved_log_selector"):
+            return
         entries = self._log_history_entries()
         if not entries:
-            QMessageBox.information(None, APP_NAME, "No saved update logs are available.")
+            self._show_message_dialog("saved_log_selector", APP_NAME, "No saved update logs are available.")
             return
 
         selected_entry = self._select_history_entry("Open update log:", entries)
@@ -1112,21 +1183,30 @@ class TrayApp:
         self._show_log_path(self._log_path_from_entry(selected_entry), f"Saved Update Log: {self._history_label(selected_entry)}", live=False)
 
     def manage_saved_logs(self) -> None:
+        if self._raise_dialog("manage_logs"):
+            return
         entries = self._log_history_entries()
         if not entries:
-            QMessageBox.information(None, APP_NAME, "No saved update logs are available.")
+            self._show_message_dialog("manage_logs", APP_NAME, "No saved update logs are available.")
             return
 
         dialog = LogManagementDialog(list(reversed(entries)))
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self._register_dialog("manage_logs", dialog)
 
-        selected_entries = dialog.selected_entries()
-        removed_count = self._delete_selected_logs(selected_entries)
-        if removed_count:
-            self.tray.showMessage(APP_NAME, f"Deleted {removed_count} saved logs.", QSystemTrayIcon.MessageIcon.Information, 4000)
-        else:
-            QMessageBox.information(None, APP_NAME, "No saved logs were deleted.")
+        def handle_finished(result: int) -> None:
+            self._unregister_dialog("manage_logs", dialog)
+            if result != int(QDialog.DialogCode.Accepted):
+                return
+            selected_entries = dialog.selected_entries()
+            removed_count = self._delete_selected_logs(selected_entries)
+            if removed_count:
+                self.tray.showMessage(APP_NAME, f"Deleted {removed_count} saved logs.", QSystemTrayIcon.MessageIcon.Information, 4000)
+            else:
+                self._show_message_dialog("manage_logs_result", APP_NAME, "No saved logs were deleted.")
+
+        dialog.finished.connect(handle_finished)
+        dialog.open()
 
     def show_live_pacman_log(self) -> None:
         self._show_log_path(PACMAN_LOG_PATH, "Live Pacman Log", live=True)
@@ -1261,9 +1341,13 @@ class TrayApp:
         return "\n".join(lines)
 
     def _show_text_dialog(self, title: str, text: str) -> None:
+        key = f"text:{title}"
+        if self._raise_dialog(key):
+            return
         dialog = QDialog()
         dialog.setWindowTitle(title)
         dialog.resize(900, 620)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         layout = QVBoxLayout(dialog)
         editor = QPlainTextEdit()
         editor.setReadOnly(True)
@@ -1273,7 +1357,20 @@ class TrayApp:
         close_button = QPushButton("Close")
         close_button.clicked.connect(dialog.close)
         layout.addWidget(close_button)
-        dialog.exec()
+        self._register_dialog(key, dialog)
+        dialog.open()
+
+    def _show_message_dialog(self, key: str, title: str, text: str, icon: QMessageBox.Icon = QMessageBox.Icon.Information) -> None:
+        if self._raise_dialog(key):
+            return
+        dialog = QMessageBox()
+        dialog.setWindowTitle(title)
+        dialog.setText(text)
+        dialog.setIcon(icon)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        dialog.setStandardButtons(QMessageBox.StandardButton.Ok)
+        self._register_dialog(key, dialog)
+        dialog.open()
 
     def _resolve_rollback_transaction(self, selected_events: list[dict[str, object]], action_mode: str) -> tuple[list[str], list[str], list[str]]:
         cache_files: list[str] = []
@@ -1689,7 +1786,12 @@ class TrayApp:
 
 
 def main() -> int:
-    return TrayApp().run()
+    try:
+        return TrayApp().run()
+    except RuntimeError as exc:
+        if str(exc) == "already-running":
+            return 0
+        raise
 
 
 if __name__ == "__main__":
