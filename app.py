@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
 APP_NAME = "CachyOS Update Tray"
 APP_ID = "cachyos-update-tray"
 BASE_DIR = Path(__file__).resolve().parent
+ICON_PATH = BASE_DIR / "icon.svg"
 HOME_DIR = Path.home()
 LOCAL_BIN_DIR = HOME_DIR / ".local" / "bin"
 CONFIG_DIR = HOME_DIR / ".config" / APP_ID
@@ -592,8 +593,11 @@ class TrayApp:
 
         self.app = QApplication(sys.argv)
         self.app.setQuitOnLastWindowClosed(False)
-        self.app.setApplicationName(APP_NAME)
+        self.app.setApplicationName(APP_ID)
         self.app.setApplicationDisplayName(APP_NAME)
+        self.app.setDesktopFileName(APP_ID)
+        self.app_icon = self._load_app_icon()
+        self.app.setWindowIcon(self.app_icon)
         self.instance_lock = QLockFile(str(INSTANCE_LOCK_PATH))
         self.instance_lock.setStaleLockTime(0)
         if not self.instance_lock.tryLock(0):
@@ -624,6 +628,11 @@ class TrayApp:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         LOGS_DIR.mkdir(parents=True, exist_ok=True)
+
+    def _load_app_icon(self) -> QIcon:
+        if ICON_PATH.exists():
+            return QIcon(str(ICON_PATH))
+        return QIcon()
 
     def _load_config(self) -> AppConfig:
         if not CONFIG_PATH.exists():
@@ -867,7 +876,9 @@ class TrayApp:
             painter.drawLine(29, 39, 42, 24)
 
         painter.end()
-        self.tray.setIcon(QIcon(pixmap))
+        dynamic_icon = QIcon(pixmap)
+        self.tray.setIcon(dynamic_icon)
+        self.app.setWindowIcon(dynamic_icon)
 
     def _draw_badge(self, painter: QPainter, text: str, bg_color: str, fg_color: str) -> None:
         painter.setBrush(QColor(bg_color))
@@ -965,7 +976,8 @@ class TrayApp:
             "Comment=Tray app for pacman update checks\n"
             f'Exec="{exec_command}"\n'
             f"Path={BASE_DIR}\n"
-            f"Icon={BASE_DIR / 'icon.svg'}\n"
+            f"Icon={ICON_PATH}\n"
+            f"StartupWMClass={APP_ID}\n"
             "Terminal=false\n"
             "Categories=System;Utility;\n"
             "StartupNotify=false\n"
@@ -1346,6 +1358,7 @@ class TrayApp:
             return
         dialog = QDialog()
         dialog.setWindowTitle(title)
+        dialog.setWindowIcon(self.app.windowIcon())
         dialog.resize(900, 620)
         dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         layout = QVBoxLayout(dialog)
@@ -1365,6 +1378,7 @@ class TrayApp:
             return
         dialog = QMessageBox()
         dialog.setWindowTitle(title)
+        dialog.setWindowIcon(self.app.windowIcon())
         dialog.setText(text)
         dialog.setIcon(icon)
         dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
